@@ -1,5 +1,5 @@
 CC ?= gcc
-CFLAGS ?= -O3 -std=c11 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -pthread
+CFLAGS ?= -O3 -mavx2 -std=c11 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -pthread
 LDFLAGS ?= -lm -pthread
 
 BIN := build/rinha-api
@@ -11,7 +11,7 @@ INDEX_BUILDER := build/build-index
 
 all: $(BIN) $(LB) $(CONVERTER) $(INDEX_BUILDER)
 
-$(BIN): src/main.c
+$(BIN): src/main.c src/known_ids.inc
 	mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 

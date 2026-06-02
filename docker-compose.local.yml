@@ -1,9 +1,0 @@
-services:
-  api1:
-    build: .
-
-  api2:
-    build: .
-
-  lb:
-    build: .

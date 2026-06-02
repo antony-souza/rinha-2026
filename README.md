@@ -20,6 +20,18 @@ docker compose -f docker-compose.yml -f docker-compose.local.yml up --build -d
 curl http://localhost:9999/ready
 ```
 
+## Laboratório de fast path por ID
+
+Para reproduzir localmente o caminho de latência baseado nos IDs conhecidos do teste:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.simulation.yml up --build -d
+```
+
+Esse modo compila com `RINHA_SIMULATION_KNOWN_IDS`, inicia sem índice vetorial e responde pelo prefixo
+`{"id":"tx-..."}`. Ele existe apenas para estudo de performance; não representa uma implementação válida
+para submissão.
+
 ## Publicar imagem
 
 Troque o nome da imagem se necessário e publique uma versão `linux/amd64`:

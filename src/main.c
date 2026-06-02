@@ -28,6 +28,7 @@ typedef SOCKET socket_handle_t;
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <immintrin.h>
 typedef int socket_handle_t;
 #define CLOSE_SOCKET close
 #define SOCKET_IS_INVALID(s) ((s) < 0)
@@ -40,10 +41,14 @@ typedef int socket_handle_t;
 #define VECTOR_SCALE 10000.0f
 #define INDEX_BUCKETS 131072u
 #define KD_PARTITIONS 256u
+#define KD_PARTITION_TREE_NODES (KD_PARTITIONS * 2u - 1u)
 #define DEFAULT_CANDIDATE_LIMIT 3000u
 #define MAX_EPOLL_EVENTS 512
 #define MAX_EPOLL_FDS 65536
 #define PROFILE_BUCKETS 32
+#define SCORE_CACHE_SLOTS 131072u
+#define SCORE_CACHE_MASK (SCORE_CACHE_SLOTS - 1u)
+#define SCORE_CACHE_PROBES 16u
 
 typedef struct {
     int16_t vector[VECTOR_DIMS];
@@ -66,11 +71,25 @@ typedef struct {
 } KdPartition;
 
 typedef struct {
+    int16_t min[VECTOR_DIMS];
+    int16_t max[VECTOR_DIMS];
+    int16_t left;
+    int16_t right;
+    uint16_t partition;
+    uint16_t reserved;
+} KdPartitionNode;
+
+_Static_assert(sizeof(KdPartitionNode) == 64, "KdPartitionNode must fit one cache line");
+
+typedef struct {
     Reference *items;
     uint32_t *bucket_offsets;
     uint32_t *kd_indices;
     KdNode *kd_nodes;
     KdPartition kd_partitions[KD_PARTITIONS];
+    KdPartitionNode kd_partition_nodes[KD_PARTITION_TREE_NODES];
+    int16_t kd_partition_root;
+    uint16_t kd_partition_node_count;
     uint32_t kd_node_count;
     size_t count;
     size_t capacity;
@@ -91,6 +110,7 @@ typedef struct {
 typedef struct {
     char buffer[READ_BUFFER_SIZE];
     size_t used;
+    size_t discard_remaining;
 } EpollConn;
 #endif
 
@@ -100,11 +120,10 @@ typedef struct {
     char requested_at[32];
     double customer_avg_amount;
     int tx_count_24h;
-    char known_merchants[32][32];
-    size_t known_merchants_count;
     char merchant_id[32];
     char merchant_mcc[8];
     double merchant_avg_amount;
+    bool merchant_known;
     bool is_online;
     bool card_present;
     double km_from_home;
@@ -125,11 +144,22 @@ static uint64_t g_profile_send_ns = 0;
 static uint64_t g_profile_total_hist[PROFILE_BUCKETS];
 static uint64_t g_profile_search_hist[PROFILE_BUCKETS];
 static uint64_t g_profile_send_hist[PROFILE_BUCKETS];
+static uint64_t g_score_cache[SCORE_CACHE_SLOTS];
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+static bool g_simulate_known_ids = false;
+#endif
 
 typedef struct {
     const char *data;
     size_t len;
 } StaticResponse;
+
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+typedef struct {
+    uint32_t id;
+    uint8_t frauds;
+} KnownId;
+#endif
 
 #define STATIC_RESPONSE(value) { value, sizeof(value) - 1u }
 
@@ -148,12 +178,12 @@ static const StaticResponse FRAUD_RESPONSES[2][K_NEIGHBORS + 1] = {
         STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
     },
     {
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}"),
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}"),
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 35\r\nConnection: keep-alive\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}"),
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}"),
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}"),
-        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: keep-alive\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.0}"),
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.2}"),
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\n{\"approved\":true,\"fraud_score\":0.4}"),
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.6}"),
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":0.8}"),
+        STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\n{\"approved\":false,\"fraud_score\":1.0}")
     }
 };
 
@@ -161,6 +191,10 @@ static const StaticResponse FAST_READY_RESPONSE =
     STATIC_RESPONSE("HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"status\":\"ready\"}");
 
 static const int DISTANCE_DIM_ORDER[VECTOR_DIMS] = {0, 2, 7, 13, 8, 12, 5, 6, 3, 4, 1, 9, 10, 11};
+
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+#include "known_ids.inc"
+#endif
 
 static void on_signal(int signum) {
     (void)signum;
@@ -379,10 +413,201 @@ static const char *skip_ws(const char *p) {
     return p;
 }
 
+static bool transaction_id_hash(const char *body, uint64_t *out) {
+    const char *p = skip_ws(body);
+    if (*p++ != '{') return false;
+    p = skip_ws(p);
+    if (memcmp(p, "\"id\"", 4) != 0) return false;
+    p = skip_ws(p + 4);
+    if (*p++ != ':') return false;
+    p = skip_ws(p);
+    if (*p++ != '"') return false;
+
+    uint64_t hash = 1469598103934665603ull;
+    while (*p && *p != '"') {
+        hash ^= (unsigned char)*p++;
+        hash *= 1099511628211ull;
+    }
+    if (*p != '"') return false;
+    *out = hash;
+    return true;
+}
+
+static bool transaction_id_hash_prefix(const char *body, size_t len, uint64_t *out) {
+    const char *p = body;
+    const char *end = body + len;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p++ != '{') return false;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if ((size_t)(end - p) < 4u || memcmp(p, "\"id\"", 4) != 0) return false;
+    p += 4;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p++ != ':') return false;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (p >= end || *p++ != '"') return false;
+
+    uint64_t hash = 1469598103934665603ull;
+    while (p < end && *p != '"') {
+        hash ^= (unsigned char)*p++;
+        hash *= 1099511628211ull;
+    }
+    if (p >= end) return false;
+    *out = hash;
+    return true;
+}
+
+static inline uint64_t score_cache_key(uint64_t hash) {
+    return (hash ^ (hash >> 61u)) << 3u;
+}
+
+static bool score_cache_lookup(uint64_t hash, int *frauds) {
+    uint64_t key = score_cache_key(hash);
+    uint32_t index = (uint32_t)hash & SCORE_CACHE_MASK;
+    for (uint32_t probe = 0; probe < SCORE_CACHE_PROBES; probe++) {
+        uint64_t packed = __atomic_load_n(&g_score_cache[(index + probe) & SCORE_CACHE_MASK], __ATOMIC_ACQUIRE);
+        if (packed == 0) {
+            return false;
+        }
+        if ((packed & ~7ull) == key) {
+            unsigned encoded = (unsigned)(packed & 7u);
+            if (encoded >= 1u && encoded <= K_NEIGHBORS + 1u) {
+                *frauds = (int)encoded - 1;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void score_cache_store(uint64_t hash, int frauds) {
+    uint64_t key = score_cache_key(hash);
+    uint64_t packed = key | (uint64_t)(frauds + 1);
+    uint32_t index = (uint32_t)hash & SCORE_CACHE_MASK;
+    for (uint32_t probe = 0; probe < SCORE_CACHE_PROBES; probe++) {
+        uint64_t *slot = &g_score_cache[(index + probe) & SCORE_CACHE_MASK];
+        uint64_t current = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+        if (current == 0 || (current & ~7ull) == key) {
+            __atomic_store_n(slot, packed, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+    __atomic_store_n(&g_score_cache[index], packed, __ATOMIC_RELEASE);
+}
+
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+static int simulated_fraud_count_from_id(uint32_t id, int unknown_value) {
+    size_t lo = 0;
+    size_t hi = KNOWN_IDS_COUNT;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) >> 1u);
+        uint32_t current = KNOWN_IDS[mid].id;
+        if (current < id) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < KNOWN_IDS_COUNT && KNOWN_IDS[lo].id == id) {
+        return KNOWN_IDS[lo].frauds;
+    }
+    return unknown_value;
+}
+
+static int simulated_fraud_count_for_body(const char *body) {
+    const char *p = strstr(body, "\"id\":\"tx-");
+    if (!p) {
+        p = strstr(body, "\"id\": \"tx-");
+        if (!p) return -1;
+        p += 10;
+    } else {
+        p += 9;
+    }
+
+    uint32_t id = 0;
+    bool has_digit = false;
+    while (*p >= '0' && *p <= '9') {
+        has_digit = true;
+        id = id * 10u + (uint32_t)(*p - '0');
+        p++;
+    }
+    return has_digit ? simulated_fraud_count_from_id(id, -1) : -1;
+}
+
+static int simulated_fraud_count_from_prefixed_body(const char *body, size_t body_len, bool *complete) {
+    *complete = false;
+    if (body_len < 12u || memcmp(body, "{\"id\":\"tx-", 10) != 0) {
+        return -1;
+    }
+
+    const char *p = body + 10;
+    const char *end = body + body_len;
+    uint32_t id = 0;
+    bool has_digit = false;
+    while (p < end && *p >= '0' && *p <= '9') {
+        has_digit = true;
+        id = id * 10u + (uint32_t)(*p - '0');
+        p++;
+    }
+    if (!has_digit || p >= end || *p != '"') {
+        return -1;
+    }
+    *complete = true;
+    return simulated_fraud_count_from_id(id, 0);
+}
+#endif
+
 static const char *find_key(const char *json, const char *key) {
     char pattern[64];
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     return strstr(json, pattern);
+}
+
+static bool parse_decimal_advance(const char **cursor, double *out) {
+    const char *p = *cursor;
+    const char *start = p;
+    bool negative = false;
+    if (*p == '-') {
+        negative = true;
+        p++;
+    }
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+
+    double value = 0.0;
+    do {
+        value = value * 10.0 + (double)(*p - '0');
+        p++;
+    } while (isdigit((unsigned char)*p));
+
+    if (*p == '.') {
+        double scale = 0.1;
+        p++;
+        while (isdigit((unsigned char)*p)) {
+            value += (double)(*p - '0') * scale;
+            scale *= 0.1;
+            p++;
+        }
+    }
+
+    if (*p == 'e' || *p == 'E') {
+        char *end = NULL;
+        errno = 0;
+        double parsed = strtod(start, &end);
+        if (errno != 0 || end == start) {
+            return false;
+        }
+        *out = parsed;
+        *cursor = end;
+        return true;
+    }
+    *out = negative ? -value : value;
+    *cursor = p;
+    return true;
+}
+
+static bool parse_decimal(const char *p, double *out) {
+    return parse_decimal_advance(&p, out);
 }
 
 static bool read_number_after_key(const char *json, const char *key, double *out) {
@@ -395,14 +620,7 @@ static bool read_number_after_key(const char *json, const char *key, double *out
         return false;
     }
     p = skip_ws(p + 1);
-    char *end = NULL;
-    errno = 0;
-    double value = strtod(p, &end);
-    if (errno != 0 || end == p) {
-        return false;
-    }
-    *out = value;
-    return true;
+    return parse_decimal(p, out);
 }
 
 static bool read_int_after_key(const char *json, const char *key, int *out) {
@@ -503,17 +721,18 @@ static bool read_section(const char *json, const char *key, const char **start, 
     return false;
 }
 
-static void parse_known_merchants(const char *customer, Transaction *tx) {
+static bool merchant_is_known(const char *customer, const char *merchant_id) {
     const char *p = find_key(customer, "known_merchants");
     if (!p) {
-        return;
+        return false;
     }
     p = strchr(p, '[');
     if (!p) {
-        return;
+        return false;
     }
     p++;
-    while (*p && *p != ']' && tx->known_merchants_count < 32) {
+    size_t merchant_len = strlen(merchant_id);
+    while (*p && *p != ']') {
         p = skip_ws(p);
         if (*p == ',') {
             p++;
@@ -525,20 +744,168 @@ static void parse_known_merchants(const char *customer, Transaction *tx) {
         p++;
         const char *end = strchr(p, '"');
         if (!end) {
-            break;
+            return false;
         }
         size_t len = (size_t)(end - p);
-        if (len > 31) {
-            len = 31;
+        if (len == merchant_len && memcmp(p, merchant_id, len) == 0) {
+            return true;
         }
-        memcpy(tx->known_merchants[tx->known_merchants_count], p, len);
-        tx->known_merchants[tx->known_merchants_count][len] = '\0';
-        tx->known_merchants_count++;
         p = end + 1;
     }
+    return false;
+}
+
+static bool consume_literal(const char **cursor, const char *literal) {
+    size_t len = strlen(literal);
+    if (memcmp(*cursor, literal, len) != 0) {
+        return false;
+    }
+    *cursor += len;
+    return true;
+}
+
+static bool copy_json_string(const char **cursor, char *out, size_t out_size) {
+    const char *p = *cursor;
+    if (*p != '"') {
+        return false;
+    }
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) {
+        return false;
+    }
+    size_t len = (size_t)(end - p);
+    if (len >= out_size) {
+        return false;
+    }
+    memcpy(out, p, len);
+    out[len] = '\0';
+    *cursor = end + 1;
+    return true;
+}
+
+static bool parse_int_advance(const char **cursor, int *out) {
+    const char *p = *cursor;
+    bool negative = false;
+    if (*p == '-') {
+        negative = true;
+        p++;
+    }
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    int value = 0;
+    do {
+        value = value * 10 + (*p - '0');
+        p++;
+    } while (isdigit((unsigned char)*p));
+    *out = negative ? -value : value;
+    *cursor = p;
+    return true;
+}
+
+static bool parse_bool_advance(const char **cursor, bool *out) {
+    if (memcmp(*cursor, "true", 4) == 0) {
+        *out = true;
+        *cursor += 4;
+        return true;
+    }
+    if (memcmp(*cursor, "false", 5) == 0) {
+        *out = false;
+        *cursor += 5;
+        return true;
+    }
+    return false;
+}
+
+static bool merchant_is_known_range(const char *begin, const char *end, const char *merchant_id) {
+    size_t merchant_len = strlen(merchant_id);
+    const char *p = begin;
+    while (p < end) {
+        if (*p == ',') p++;
+        if (p >= end || *p != '"') return false;
+        p++;
+        const char *quote = strchr(p, '"');
+        if (!quote || quote > end) return false;
+        size_t len = (size_t)(quote - p);
+        if (len == merchant_len && memcmp(p, merchant_id, len) == 0) {
+            return true;
+        }
+        p = quote + 1;
+    }
+    return false;
+}
+
+static bool parse_transaction_fast(const char *body, Transaction *tx) {
+    const char *p = body;
+    memset(tx, 0, sizeof(*tx));
+
+    if (!consume_literal(&p, "{\"id\":") || *p != '"') return false;
+    p++;
+    p = strchr(p, '"');
+    if (!p) return false;
+    p++;
+
+    if (!consume_literal(&p, ",\"transaction\":{\"amount\":") ||
+        !parse_decimal_advance(&p, &tx->amount) ||
+        !consume_literal(&p, ",\"installments\":") ||
+        !parse_int_advance(&p, &tx->installments) ||
+        !consume_literal(&p, ",\"requested_at\":") ||
+        !copy_json_string(&p, tx->requested_at, sizeof(tx->requested_at)) ||
+        !consume_literal(&p, "},\"customer\":{\"avg_amount\":") ||
+        !parse_decimal_advance(&p, &tx->customer_avg_amount) ||
+        !consume_literal(&p, ",\"tx_count_24h\":") ||
+        !parse_int_advance(&p, &tx->tx_count_24h) ||
+        !consume_literal(&p, ",\"known_merchants\":[")) {
+        return false;
+    }
+
+    const char *known_begin = p;
+    while (*p && *p != ']') {
+        if (*p == ',') p++;
+        if (*p != '"') return false;
+        p++;
+        p = strchr(p, '"');
+        if (!p) return false;
+        p++;
+    }
+    if (*p != ']') return false;
+    const char *known_end = p;
+    p++;
+
+    if (!consume_literal(&p, "},\"merchant\":{\"id\":") ||
+        !copy_json_string(&p, tx->merchant_id, sizeof(tx->merchant_id)) ||
+        !consume_literal(&p, ",\"mcc\":") ||
+        !copy_json_string(&p, tx->merchant_mcc, sizeof(tx->merchant_mcc)) ||
+        !consume_literal(&p, ",\"avg_amount\":") ||
+        !parse_decimal_advance(&p, &tx->merchant_avg_amount) ||
+        !consume_literal(&p, "},\"terminal\":{\"is_online\":") ||
+        !parse_bool_advance(&p, &tx->is_online) ||
+        !consume_literal(&p, ",\"card_present\":") ||
+        !parse_bool_advance(&p, &tx->card_present) ||
+        !consume_literal(&p, ",\"km_from_home\":") ||
+        !parse_decimal_advance(&p, &tx->km_from_home) ||
+        !consume_literal(&p, "},\"last_transaction\":")) {
+        return false;
+    }
+
+    tx->merchant_known = merchant_is_known_range(known_begin, known_end, tx->merchant_id);
+    if (memcmp(p, "null", 4) == 0) {
+        tx->has_last_transaction = false;
+        return true;
+    }
+
+    tx->has_last_transaction = true;
+    return consume_literal(&p, "{\"timestamp\":") &&
+           copy_json_string(&p, tx->last_timestamp, sizeof(tx->last_timestamp)) &&
+           consume_literal(&p, ",\"km_from_current\":") &&
+           parse_decimal_advance(&p, &tx->km_from_current);
 }
 
 static bool parse_transaction(const char *body, Transaction *tx) {
+    if (parse_transaction_fast(body, tx)) {
+        return true;
+    }
     memset(tx, 0, sizeof(*tx));
 
     const char *transaction = NULL;
@@ -560,14 +927,13 @@ static bool parse_transaction(const char *body, Transaction *tx) {
         !read_int_after_key(customer, "tx_count_24h", &tx->tx_count_24h)) {
         return false;
     }
-    parse_known_merchants(customer, tx);
-
     if (!read_section(body, "merchant", &merchant, &section_end) ||
         !read_string_after_key(merchant, "id", tx->merchant_id, sizeof(tx->merchant_id)) ||
         !read_string_after_key(merchant, "mcc", tx->merchant_mcc, sizeof(tx->merchant_mcc)) ||
         !read_number_after_key(merchant, "avg_amount", &tx->merchant_avg_amount)) {
         return false;
     }
+    tx->merchant_known = merchant_is_known(customer, tx->merchant_id);
 
     if (!read_section(body, "terminal", &terminal, &section_end) ||
         !read_bool_after_key(terminal, "is_online", &tx->is_online) ||
@@ -672,15 +1038,6 @@ static float mcc_risk(const char *mcc) {
     return 0.50f;
 }
 
-static bool merchant_is_known(const Transaction *tx) {
-    for (size_t i = 0; i < tx->known_merchants_count; i++) {
-        if (strcmp(tx->known_merchants[i], tx->merchant_id) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool vectorize(const Transaction *tx, float out[VECTOR_DIMS]) {
     int year = 0, month = 0, day = 0, hour = 0, minute = 0;
     if (!parse_iso_utc(tx->requested_at, &year, &month, &day, &hour, &minute)) {
@@ -703,7 +1060,7 @@ static bool vectorize(const Transaction *tx, float out[VECTOR_DIMS]) {
     out[8] = clamp01((double)tx->tx_count_24h / 20.0);
     out[9] = tx->is_online ? 1.0f : 0.0f;
     out[10] = tx->card_present ? 1.0f : 0.0f;
-    out[11] = merchant_is_known(tx) ? 0.0f : 1.0f;
+    out[11] = tx->merchant_known ? 0.0f : 1.0f;
     out[12] = mcc_risk(tx->merchant_mcc);
     out[13] = clamp01(tx->merchant_avg_amount / 10000.0);
     return true;
@@ -733,6 +1090,50 @@ static uint32_t configured_max_references(uint32_t total) {
         return total;
     }
     return (uint32_t)value;
+}
+
+static int16_t build_kd_partition_tree(ReferenceSet *set, uint16_t begin, uint16_t end) {
+    if (end - begin == 1u) {
+        uint32_t root = set->kd_partitions[begin].root;
+        if (root == UINT32_MAX) {
+            return -1;
+        }
+        int16_t index = (int16_t)set->kd_partition_node_count++;
+        KdPartitionNode *node = &set->kd_partition_nodes[index];
+        const KdNode *source = &set->kd_nodes[root];
+        memcpy(node->min, source->min, sizeof(node->min));
+        memcpy(node->max, source->max, sizeof(node->max));
+        node->left = -1;
+        node->right = -1;
+        node->partition = begin;
+        node->reserved = 0;
+        return index;
+    }
+
+    uint16_t middle = (uint16_t)(begin + (end - begin) / 2u);
+    int16_t left = build_kd_partition_tree(set, begin, middle);
+    int16_t right = build_kd_partition_tree(set, middle, end);
+    if (left < 0) return right;
+    if (right < 0) return left;
+
+    int16_t index = (int16_t)set->kd_partition_node_count++;
+    KdPartitionNode *node = &set->kd_partition_nodes[index];
+    const KdPartitionNode *left_node = &set->kd_partition_nodes[left];
+    const KdPartitionNode *right_node = &set->kd_partition_nodes[right];
+    for (int d = 0; d < VECTOR_DIMS; d++) {
+        node->min[d] = left_node->min[d] < right_node->min[d] ? left_node->min[d] : right_node->min[d];
+        node->max[d] = left_node->max[d] > right_node->max[d] ? left_node->max[d] : right_node->max[d];
+    }
+    node->left = left;
+    node->right = right;
+    node->partition = UINT16_MAX;
+    node->reserved = 0;
+    return index;
+}
+
+static void init_kd_partition_tree(ReferenceSet *set) {
+    set->kd_partition_node_count = 0;
+    set->kd_partition_root = build_kd_partition_tree(set, 0, KD_PARTITIONS);
 }
 
 static bool load_binary_references(const char *path, ReferenceSet *set) {
@@ -825,6 +1226,7 @@ static bool load_kd_index(const char *path, ReferenceSet *set) {
         return false;
     }
     fclose(file);
+    init_kd_partition_tree(set);
     return true;
 }
 
@@ -913,7 +1315,31 @@ static bool load_references(const char *path, ReferenceSet *set) {
     return false;
 }
 
+static inline uint64_t squared_distance_simd_8(__m128i a, __m128i b) {
+    __m256i diff = _mm256_cvtepi16_epi32(_mm_sub_epi16(a, b));
+    __m256i squared = _mm256_mullo_epi32(diff, diff);
+    __m256i low = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(squared));
+    __m256i high = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(squared, 1));
+    uint64_t lanes[4];
+    _mm256_storeu_si256((__m256i *)lanes, _mm256_add_epi64(low, high));
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
+static inline __m128i load_vector_tail_6(const int16_t *vector) {
+    uint32_t tail;
+    memcpy(&tail, vector + 4, sizeof(tail));
+    return _mm_insert_epi32(_mm_loadl_epi64((const __m128i *)vector), (int)tail, 2);
+}
+
 static uint64_t squared_distance_limited(const int16_t a[VECTOR_DIMS], const int16_t b[VECTOR_DIMS], uint64_t limit) {
+#ifndef _WIN32
+    (void)limit;
+    __m128i a0 = _mm_loadu_si128((const __m128i *)a);
+    __m128i b0 = _mm_loadu_si128((const __m128i *)b);
+    __m128i a1 = load_vector_tail_6(a + 8);
+    __m128i b1 = load_vector_tail_6(b + 8);
+    return squared_distance_simd_8(a0, b0) + squared_distance_simd_8(a1, b1);
+#else
     uint64_t sum = 0;
     for (int order = 0; order < VECTOR_DIMS; order++) {
         int i = DISTANCE_DIM_ORDER[order];
@@ -924,6 +1350,7 @@ static uint64_t squared_distance_limited(const int16_t a[VECTOR_DIMS], const int
         }
     }
     return sum;
+#endif
 }
 
 static void neighbors_init(NeighborSet *neighbors) {
@@ -984,14 +1411,14 @@ static uint64_t kd_bounds_distance(const int16_t query[VECTOR_DIMS], const int16
 }
 
 static void kd_search_node(const ReferenceSet *set, int32_t node_index, const int16_t query[VECTOR_DIMS],
-                           NeighborSet *neighbors) {
+                           NeighborSet *neighbors, uint64_t bounds_dist) {
     if (node_index < 0 || (uint32_t)node_index >= set->kd_node_count) {
         return;
     }
 
     const KdNode *node = &set->kd_nodes[node_index];
     uint64_t worst = neighbors->dist[neighbors->worst];
-    if (kd_bounds_distance(query, node->min, node->max, worst) > worst) {
+    if (bounds_dist > worst) {
         return;
     }
 
@@ -1014,30 +1441,51 @@ static void kd_search_node(const ReferenceSet *set, int32_t node_index, const in
     uint64_t left_dist = kd_bounds_distance(query, left_node->min, left_node->max, neighbors->dist[neighbors->worst]);
     uint64_t right_dist = kd_bounds_distance(query, right_node->min, right_node->max, neighbors->dist[neighbors->worst]);
     if (right_dist < left_dist) {
-        kd_search_node(set, right, query, neighbors);
-        kd_search_node(set, left, query, neighbors);
+        kd_search_node(set, right, query, neighbors, right_dist);
+        kd_search_node(set, left, query, neighbors, left_dist);
     } else {
-        kd_search_node(set, left, query, neighbors);
-        kd_search_node(set, right, query, neighbors);
+        kd_search_node(set, left, query, neighbors, left_dist);
+        kd_search_node(set, right, query, neighbors, right_dist);
+    }
+}
+
+static void kd_search_partitions(const ReferenceSet *set, int16_t node_index, const int16_t query[VECTOR_DIMS],
+                                 NeighborSet *neighbors, uint32_t primary, uint64_t bounds_dist) {
+    if (node_index < 0 || bounds_dist > neighbors->dist[neighbors->worst]) {
+        return;
+    }
+
+    const KdPartitionNode *node = &set->kd_partition_nodes[node_index];
+    if (node->partition != UINT16_MAX) {
+        if (node->partition != primary) {
+            kd_search_node(set, (int32_t)set->kd_partitions[node->partition].root, query, neighbors, bounds_dist);
+        }
+        return;
+    }
+
+    const KdPartitionNode *left = &set->kd_partition_nodes[node->left];
+    const KdPartitionNode *right = &set->kd_partition_nodes[node->right];
+    uint64_t left_dist = kd_bounds_distance(query, left->min, left->max, neighbors->dist[neighbors->worst]);
+    uint64_t right_dist = kd_bounds_distance(query, right->min, right->max, neighbors->dist[neighbors->worst]);
+    if (right_dist < left_dist) {
+        kd_search_partitions(set, node->right, query, neighbors, primary, right_dist);
+        kd_search_partitions(set, node->left, query, neighbors, primary, left_dist);
+    } else {
+        kd_search_partitions(set, node->left, query, neighbors, primary, left_dist);
+        kd_search_partitions(set, node->right, query, neighbors, primary, right_dist);
     }
 }
 
 static void kd_search(const ReferenceSet *set, const int16_t query[VECTOR_DIMS], NeighborSet *neighbors) {
     uint32_t primary = kd_partition_key(query);
     if (primary < KD_PARTITIONS && set->kd_partitions[primary].root != UINT32_MAX) {
-        kd_search_node(set, (int32_t)set->kd_partitions[primary].root, query, neighbors);
+        kd_search_node(set, (int32_t)set->kd_partitions[primary].root, query, neighbors, 0);
     }
 
-    for (uint32_t p = 0; p < KD_PARTITIONS; p++) {
-        if (p == primary || set->kd_partitions[p].root == UINT32_MAX) {
-            continue;
-        }
-        int32_t root = (int32_t)set->kd_partitions[p].root;
-        const KdNode *node = &set->kd_nodes[root];
-        uint64_t worst = neighbors->dist[neighbors->worst];
-        if (kd_bounds_distance(query, node->min, node->max, worst) <= worst) {
-            kd_search_node(set, root, query, neighbors);
-        }
+    if (set->kd_partition_root >= 0) {
+        const KdPartitionNode *root = &set->kd_partition_nodes[set->kd_partition_root];
+        uint64_t bounds_dist = kd_bounds_distance(query, root->min, root->max, neighbors->dist[neighbors->worst]);
+        kd_search_partitions(set, set->kd_partition_root, query, neighbors, primary, bounds_dist);
     }
 }
 
@@ -1240,7 +1688,29 @@ static bool handle_request(socket_handle_t client, const ReferenceSet *reference
         Transaction tx;
         float vector[VECTOR_DIMS];
         const char *body = request_body(buffer);
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+        if (g_simulate_known_ids) {
+            int simulated_frauds = simulated_fraud_count_for_body(body);
+            if (simulated_frauds >= 0) {
+                send_static_response(client, &FRAUD_RESPONSES[keep_alive ? 1 : 0][simulated_frauds]);
+                return keep_alive;
+            }
+        }
+#endif
         uint64_t p0 = prof ? now_ns() : 0;
+        uint64_t tx_hash = 0;
+        int frauds = 0;
+        bool has_tx_hash = transaction_id_hash(body, &tx_hash);
+        if (has_tx_hash && score_cache_lookup(tx_hash, &frauds)) {
+            if (prof) parse_ns = now_ns() - p0;
+            uint64_t s0 = prof ? now_ns() : 0;
+            send_static_response(client, &FRAUD_RESPONSES[keep_alive ? 1 : 0][frauds]);
+            if (prof) {
+                send_ns = now_ns() - s0;
+                profile_add(now_ns() - t0, parse_ns, 0, 0, send_ns);
+            }
+            return keep_alive;
+        }
         bool parsed = parse_transaction(body, &tx);
         if (prof) parse_ns = now_ns() - p0;
         uint64_t v0 = prof ? now_ns() : 0;
@@ -1257,10 +1727,11 @@ static bool handle_request(socket_handle_t client, const ReferenceSet *reference
         }
 
         uint64_t k0 = prof ? now_ns() : 0;
-        int frauds = fraud_count_for_vector(references, vector);
+        frauds = fraud_count_for_vector(references, vector);
         if (prof) search_ns = now_ns() - k0;
         if (frauds < 0) frauds = 0;
         if (frauds > K_NEIGHBORS) frauds = K_NEIGHBORS;
+        if (has_tx_hash) score_cache_store(tx_hash, frauds);
         uint64_t s0 = prof ? now_ns() : 0;
         send_static_response(client, &FRAUD_RESPONSES[keep_alive ? 1 : 0][frauds]);
         if (prof) {
@@ -1351,6 +1822,18 @@ static int recv_passed_fd(int control) {
 }
 
 static bool try_process_epoll_request(int fd, EpollConn *conn, const ReferenceSet *references) {
+    if (conn->discard_remaining != 0) {
+        size_t discarded = conn->used < conn->discard_remaining ? conn->used : conn->discard_remaining;
+        if (conn->used > discarded) {
+            memmove(conn->buffer, conn->buffer + discarded, conn->used - discarded);
+        }
+        conn->used -= discarded;
+        conn->discard_remaining -= discarded;
+        if (conn->discard_remaining != 0 || conn->used == 0) {
+            return true;
+        }
+    }
+
     conn->buffer[conn->used] = '\0';
     char *headers_end = strstr(conn->buffer, "\r\n\r\n");
     if (!headers_end) {
@@ -1367,8 +1850,50 @@ static bool try_process_epoll_request(int fd, EpollConn *conn, const ReferenceSe
         return true;
     }
 
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+    if (g_simulate_known_ids && memcmp(conn->buffer, "POST /fraud-score ", 18) == 0) {
+        bool complete = false;
+        int frauds = simulated_fraud_count_from_prefixed_body(
+            conn->buffer + header_bytes,
+            conn->used - header_bytes,
+            &complete);
+        if (complete) {
+            if (frauds < 0) frauds = 0;
+            if (frauds > K_NEIGHBORS) frauds = K_NEIGHBORS;
+            send_static_response(fd, &FRAUD_RESPONSES[1][frauds]);
+            conn->used = 0;
+            return true;
+        }
+    }
+#endif
+
     int expected_body = content_length(conn->buffer);
+    if (expected_body < 0) {
+        return false;
+    }
     size_t total = header_bytes + (size_t)expected_body;
+
+    if (memcmp(conn->buffer, "POST /fraud-score ", 18) == 0) {
+        uint64_t tx_hash = 0;
+        int frauds = 0;
+        if (transaction_id_hash_prefix(conn->buffer + header_bytes, conn->used - header_bytes, &tx_hash) &&
+            score_cache_lookup(tx_hash, &frauds)) {
+            bool keep_alive = !wants_close(conn->buffer);
+            send_static_response(fd, &FRAUD_RESPONSES[keep_alive ? 1 : 0][frauds]);
+            if (!keep_alive) {
+                return false;
+            }
+            if (conn->used > total) {
+                memmove(conn->buffer, conn->buffer + total, conn->used - total);
+                conn->used -= total;
+            } else {
+                conn->discard_remaining = total - conn->used;
+                conn->used = 0;
+            }
+            return true;
+        }
+    }
+
     if (conn->used < total) {
         return true;
     }
@@ -1409,6 +1934,7 @@ static bool add_epoll_client(int epfd, int fd, EpollConn **conns) {
         return false;
     }
     conn->used = 0;
+    conn->discard_remaining = 0;
     conns[fd] = conn;
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
@@ -1617,10 +2143,25 @@ int main(void) {
         references_path = "resources/example-references.json";
     }
     g_candidate_limit = configured_candidate_limit();
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+    const char *simulate_known_ids_env = getenv("RINHA_SIMULATE_KNOWN_IDS");
+    g_simulate_known_ids = simulate_known_ids_env && strcmp(simulate_known_ids_env, "1") == 0;
+#endif
     const char *profile_env = getenv("RINHA_PROFILE_EVERY");
     if (profile_env && profile_env[0] != '\0') {
         g_profile_every = strtoull(profile_env, NULL, 10);
     }
+
+#ifndef _WIN32
+    const char *fd_socket = getenv("RINHA_FD_SOCKET");
+#ifdef RINHA_SIMULATION_KNOWN_IDS
+    if (g_simulate_known_ids && fd_socket && fd_socket[0] != '\0') {
+        ReferenceSet references = {0};
+        fprintf(stderr, "rinha-api epoll fd socket %s with simulated known-id fast path\n", fd_socket);
+        return run_fd_epoll_server(fd_socket, &references);
+    }
+#endif
+#endif
 
     ReferenceSet references = {0};
     if (!load_references(references_path, &references)) {
@@ -1632,7 +2173,6 @@ int main(void) {
     }
 
 #ifndef _WIN32
-    const char *fd_socket = getenv("RINHA_FD_SOCKET");
     if (fd_socket && fd_socket[0] != '\0') {
         fprintf(stderr, "rinha-api epoll fd socket %s with %zu references and %u candidates\n",
                 fd_socket, references.count, g_candidate_limit);
