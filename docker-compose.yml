@@ -1,6 +1,6 @@
 services:
   lb:
-    image: antonybash/rinha-2026:rafael-lb-fd-p99
+    image: antonybash/rinha-2026:lb-fd-p99
     container_name: detecta-lb
     platform: linux/amd64
     cpuset: "2,3"
@@ -31,7 +31,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: antonybash/rinha-2026:rafael-api-884bebb
+    image: antonybash/rinha-2026:api-884bebb
     container_name: detecta-api1
     platform: linux/amd64
     cpuset: "0"
@@ -67,7 +67,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: antonybash/rinha-2026:rafael-api-884bebb
+    image: antonybash/rinha-2026:api-884bebb
     container_name: detecta-api2
     platform: linux/amd64
     cpuset: "1"
