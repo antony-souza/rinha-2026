@@ -1,0 +1,7 @@
+{
+  "participants": ["Antony Souza"],
+  "social": ["https://github.com/antony-souza"],
+  "source-code-repo": "https://github.com/antony-souza/rinha-2026",
+  "stack": ["c", "epoll", "unix-sockets", "kd-tree"],
+  "open_to_work": false
+}
