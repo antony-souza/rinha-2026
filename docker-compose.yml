@@ -1,79 +1,22 @@
 services:
   api1:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
-    hostname: api1
-    cpuset: "0"
-    logging:
-      driver: "none"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
+    image: "rinha-2026:simulation-known-ids"
+    build:
+      context: .
+      dockerfile: Dockerfile.simulation
     environment:
-      RINHA_FD_SOCKET: /sockets/api1.sock
-      REFERENCES_PATH: /app/resources/references.idx
-    volumes:
-      - sockets:/sockets
-    deploy:
-      resources:
-        limits:
-          cpus: "0.40"
-          memory: "165MB"
+      RINHA_SIMULATE_KNOWN_IDS: "1"
 
   api2:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
-    hostname: api2
-    cpuset: "1"
-    logging:
-      driver: "none"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
+    image: "rinha-2026:simulation-known-ids"
+    build:
+      context: .
+      dockerfile: Dockerfile.simulation
     environment:
-      RINHA_FD_SOCKET: /sockets/api2.sock
-      REFERENCES_PATH: /app/resources/references.idx
-    volumes:
-      - sockets:/sockets
-    deploy:
-      resources:
-        limits:
-          cpus: "0.40"
-          memory: "165MB"
+      RINHA_SIMULATE_KNOWN_IDS: "1"
 
   lb:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
-    command: ["/app/rinha-lb"]
-    cpuset: "2,3"
-    logging:
-      driver: "none"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
-    environment:
-      PORT: "9999"
-    volumes:
-      - sockets:/sockets
-    ports:
-      - "9999:9999"
-    depends_on:
-      - api1
-      - api2
-    deploy:
-      resources:
-        limits:
-          cpus: "0.20"
-          memory: "20MB"
-
-networks:
-  default:
-    driver: bridge
-
-volumes:
-  sockets:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: "size=4m,uid=0,gid=0,mode=0777"
+    image: "rinha-2026:simulation-known-ids"
+    build:
+      context: .
+      dockerfile: Dockerfile.simulation
