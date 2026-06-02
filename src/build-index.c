@@ -7,7 +7,7 @@
 #define PARTITIONS 256u
 #define LEAF_SIZE 16u
 #define MAGIC "R26K"
-#define VERSION 2u
+#define VERSION 3u
 
 typedef struct {
     int16_t vector[DIMS];
@@ -15,13 +15,13 @@ typedef struct {
 } Ref;
 
 typedef struct {
-    int32_t left;
-    int32_t right;
+    int32_t right_or_leaf_count;
     uint32_t start;
-    uint32_t count;
     int16_t min[DIMS];
     int16_t max[DIMS];
 } Node;
+
+_Static_assert(sizeof(Node) == 64, "Node must fit one cache line");
 
 typedef struct {
     uint32_t root;
@@ -77,10 +77,8 @@ static int32_t build_node(uint32_t start, uint32_t count) {
     int32_t ni = new_node();
     if (ni < 0) return -1;
     Node *n = &nodes[ni];
-    n->left = -1;
-    n->right = -1;
+    n->right_or_leaf_count = -(int32_t)count;
     n->start = start;
-    n->count = count;
     for (int d = 0; d < DIMS; d++) {
         n->min[d] = INT16_MAX;
         n->max[d] = INT16_MIN;
@@ -108,11 +106,10 @@ static int32_t build_node(uint32_t start, uint32_t count) {
     uint32_t left = count / 2u;
     int32_t left_node = build_node(start, left);
     int32_t right_node = build_node(start + left, count - left);
+    if (left_node != ni + 1 || right_node < 0) return -1;
     n = &nodes[ni];
-    n->left = left_node;
-    n->right = right_node;
+    n->right_or_leaf_count = right_node;
     n->start = 0;
-    n->count = 0;
     return ni;
 }
 
