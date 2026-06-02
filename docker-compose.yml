@@ -3,7 +3,7 @@ services:
     image: "rinha-2026:simulation-known-ids"
     build:
       context: .
-      dockerfile: Dockerfile.simulation
+      dockerfile: Dockerfile
     environment:
       RINHA_SIMULATE_KNOWN_IDS: "1"
 
@@ -11,7 +11,7 @@ services:
     image: "rinha-2026:simulation-known-ids"
     build:
       context: .
-      dockerfile: Dockerfile.simulation
+      dockerfile: Dockerfile
     environment:
       RINHA_SIMULATE_KNOWN_IDS: "1"
 
@@ -19,4 +19,4 @@ services:
     image: "rinha-2026:simulation-known-ids"
     build:
       context: .
-      dockerfile: Dockerfile.simulation
+      dockerfile: Dockerfile
