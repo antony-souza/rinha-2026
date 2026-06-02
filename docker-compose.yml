@@ -1,6 +1,6 @@
 services:
   api1:
-    image: "${RINHA_IMAGE:-antony-souza/rinha-2026:latest}"
+    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
     hostname: api1
     cpuset: "0"
     logging:
@@ -21,7 +21,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: "${RINHA_IMAGE:-antony-souza/rinha-2026:latest}"
+    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
     hostname: api2
     cpuset: "1"
     logging:
@@ -42,7 +42,7 @@ services:
           memory: "165MB"
 
   lb:
-    image: "${RINHA_IMAGE:-antony-souza/rinha-2026:latest}"
+    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
     command: ["/app/rinha-lb"]
     cpuset: "2,3"
     logging:

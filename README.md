@@ -25,7 +25,7 @@ curl http://localhost:9999/ready
 Troque o nome da imagem se necessário e publique uma versão `linux/amd64`:
 
 ```sh
-docker buildx build --platform linux/amd64 -t antony-souza/rinha-2026:latest --push .
+docker buildx build --platform linux/amd64 -t antonybash/rinha-2026:latest --push .
 ```
 
 O `docker-compose.yml` usa `RINHA_IMAGE` para permitir outro nome sem editar o arquivo:
