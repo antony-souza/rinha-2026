@@ -1,6 +1,6 @@
 services:
   api1:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
+    image: antonybash/rinha-2026:fd-fast-api
     hostname: api1
     cpuset: "0"
     logging:
@@ -11,6 +11,8 @@ services:
         hard: 65535
     environment:
       RINHA_FD_SOCKET: /sockets/api1.sock
+      CANDIDATE_LIMIT: "1500"
+      APPROVAL_THRESHOLD: "0.6"
       REFERENCES_PATH: /app/resources/references.idx
     volumes:
       - sockets:/sockets
@@ -21,7 +23,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
+    image: antonybash/rinha-2026:fd-fast-api
     hostname: api2
     cpuset: "1"
     logging:
@@ -32,6 +34,8 @@ services:
         hard: 65535
     environment:
       RINHA_FD_SOCKET: /sockets/api2.sock
+      CANDIDATE_LIMIT: "1500"
+      APPROVAL_THRESHOLD: "0.6"
       REFERENCES_PATH: /app/resources/references.idx
     volumes:
       - sockets:/sockets
@@ -42,7 +46,7 @@ services:
           memory: "165MB"
 
   lb:
-    image: "${RINHA_IMAGE:-antonybash/rinha-2026:latest}"
+    image: antonybash/rinha-2026:fd-fast-api
     command: ["/app/rinha-lb"]
     cpuset: "2,3"
     logging:
