@@ -1,21 +1,65 @@
 services:
-  api1:
-    image: antonybash/rinha-2026:fd-fast-api
-    hostname: api1
-    cpuset: "0"
+  lb:
+    image: antonybash/rinha-2026:rafael-lb-fd-p99
+    container_name: detecta-lb
+    platform: linux/amd64
+    cpuset: "2,3"
+    ports:
+      - "9999:9999"
+    networks:
+      - rinha
+    volumes:
+      - sockets:/sockets
+    environment:
+      LB_PORT: "9999"
+      LB_BACKLOG: "65535"
+      LB_ACCEPT_BATCH: "64"
+      API_SOCKETS: "/sockets/api1-w0.sock,/sockets/api2-w0.sock"
+    depends_on:
+      api1:
+        condition: service_started
+      api2:
+        condition: service_started
     logging:
-      driver: "none"
+      driver: none
+    ulimits:
+      nofile: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: "20MB"
+
+  api1:
+    image: antonybash/rinha-2026:rafael-api-884bebb
+    container_name: detecta-api1
+    platform: linux/amd64
+    cpuset: "0"
+    networks:
+      - rinha
+    volumes:
+      - sockets:/sockets
+    environment:
+      API_SOCKET_PREFIX: "/sockets/api1"
+      API_WORKERS: "1"
+      CONN_POOL_CAP: "512"
+      API_WARMUP_QUERIES: "4096"
+      INDEX_MLOCK: "1"
+      INDEX_PATH: "/index/index.bin"
+      EPOLL_SPIN_US: "0"
+      EPOLL_IDLE_US: "60"
+      EPOLL_BUSY_POLL_US: "0"
+      EPOLL_BUSY_POLL_BUDGET: "8"
+      EPOLL_PREFER_BUSY_POLL: "0"
+    logging:
+      driver: none
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    environment:
-      RINHA_FD_SOCKET: /sockets/api1.sock
-      CANDIDATE_LIMIT: "1500"
-      APPROVAL_THRESHOLD: "0.6"
-      REFERENCES_PATH: /app/resources/references.idx
-    volumes:
-      - sockets:/sockets
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -23,55 +67,42 @@ services:
           memory: "165MB"
 
   api2:
-    image: antonybash/rinha-2026:fd-fast-api
-    hostname: api2
+    image: antonybash/rinha-2026:rafael-api-884bebb
+    container_name: detecta-api2
+    platform: linux/amd64
     cpuset: "1"
+    network_mode: "none"
+    volumes:
+      - sockets:/sockets
+    environment:
+      API_SOCKET_PREFIX: "/sockets/api2"
+      API_WORKERS: "1"
+      CONN_POOL_CAP: "512"
+      API_WARMUP_QUERIES: "4096"
+      INDEX_MLOCK: "1"
+      INDEX_PATH: "/index/index.bin"
+      EPOLL_SPIN_US: "0"
+      EPOLL_IDLE_US: "60"
+      EPOLL_BUSY_POLL_US: "0"
+      EPOLL_BUSY_POLL_BUDGET: "8"
+      EPOLL_PREFER_BUSY_POLL: "0"
     logging:
-      driver: "none"
+      driver: none
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
-    environment:
-      RINHA_FD_SOCKET: /sockets/api2.sock
-      CANDIDATE_LIMIT: "1500"
-      APPROVAL_THRESHOLD: "0.6"
-      REFERENCES_PATH: /app/resources/references.idx
-    volumes:
-      - sockets:/sockets
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
           cpus: "0.40"
           memory: "165MB"
 
-  lb:
-    image: antonybash/rinha-2026:fd-fast-api
-    command: ["/app/rinha-lb"]
-    cpuset: "2,3"
-    logging:
-      driver: "none"
-    ulimits:
-      nofile:
-        soft: 65535
-        hard: 65535
-    environment:
-      PORT: "9999"
-    volumes:
-      - sockets:/sockets
-    ports:
-      - "9999:9999"
-    depends_on:
-      - api1
-      - api2
-    deploy:
-      resources:
-        limits:
-          cpus: "0.20"
-          memory: "20MB"
-
 networks:
-  default:
+  rinha:
     driver: bridge
 
 volumes:
