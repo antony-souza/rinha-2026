@@ -796,7 +796,7 @@ static bool load_kd_index(const char *path, ReferenceSet *set) {
         fread(&version, 4, 1, file) != 1 ||
         fread(&count, 4, 1, file) != 1 ||
         fread(&node_count, 4, 1, file) != 1 ||
-        version != 1u) {
+        (version != 1u && version != 2u)) {
         fclose(file);
         return false;
     }
@@ -804,9 +804,9 @@ static bool load_kd_index(const char *path, ReferenceSet *set) {
     set->capacity = count;
     set->kd_node_count = node_count;
     set->kd_nodes = malloc((size_t)node_count * sizeof(*set->kd_nodes));
-    set->kd_indices = malloc((size_t)count * sizeof(*set->kd_indices));
+    set->kd_indices = version == 1u ? malloc((size_t)count * sizeof(*set->kd_indices)) : NULL;
     set->items = malloc((size_t)count * sizeof(*set->items));
-    if (!set->kd_nodes || !set->kd_indices || !set->items) {
+    if (!set->kd_nodes || (version == 1u && !set->kd_indices) || !set->items) {
         fclose(file);
         free(set->kd_nodes);
         free(set->kd_indices);
@@ -816,7 +816,7 @@ static bool load_kd_index(const char *path, ReferenceSet *set) {
     }
     if (fread(set->kd_partitions, sizeof(set->kd_partitions[0]), KD_PARTITIONS, file) != KD_PARTITIONS ||
         fread(set->kd_nodes, sizeof(set->kd_nodes[0]), node_count, file) != node_count ||
-        fread(set->kd_indices, sizeof(set->kd_indices[0]), count, file) != count ||
+        (version == 1u && fread(set->kd_indices, sizeof(set->kd_indices[0]), count, file) != count) ||
         fread(set->items, sizeof(set->items[0]), count, file) != count) {
         fclose(file);
         free(set->kd_nodes);
@@ -999,7 +999,7 @@ static void kd_search_node(const ReferenceSet *set, int32_t node_index, const in
     if (node->count > 0) {
         uint32_t end = node->start + node->count;
         for (uint32_t pos = node->start; pos < end; pos++) {
-            uint32_t ref_index = set->kd_indices[pos];
+            uint32_t ref_index = set->kd_indices ? set->kd_indices[pos] : pos;
             if (ref_index < set->count) {
                 consider_neighbor(&set->items[ref_index], query, neighbors);
             }

@@ -5,9 +5,9 @@
 
 #define DIMS 14
 #define PARTITIONS 256u
-#define LEAF_SIZE 32u
+#define LEAF_SIZE 16u
 #define MAGIC "R26K"
-#define VERSION 1u
+#define VERSION 2u
 
 typedef struct {
     int16_t vector[DIMS];
@@ -159,8 +159,9 @@ int main(int argc, char **argv) {
     fwrite(&node_count, 4, 1, out);
     fwrite(parts, sizeof(parts[0]), PARTITIONS, out);
     fwrite(nodes, sizeof(nodes[0]), node_count, out);
-    fwrite(ids, sizeof(ids[0]), count, out);
-    fwrite(refs, sizeof(refs[0]), count, out);
+    for (uint32_t i = 0; i < count; i++) {
+        fwrite(&refs[ids[i]], sizeof(refs[0]), 1, out);
+    }
     fclose(out);
     fprintf(stderr, "wrote %u refs, %u nodes\n", count, node_count);
     return 0;
